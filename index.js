@@ -267,6 +267,7 @@
   ];
 
   function prepareOutgoing(text) {
+    text = text.replace(/[\u2018\u2019\u02BC\u0060\u00B4]/g, "'").replace(/[\u201C\u201D]/g, '"');
     const { masked, tokens } = protect(text);
     const keep = (es) => { tokens.push(es); return "{" + (tokens.length - 1) + "}"; };
     // reverse game terms: "feathers" -> "plumas"
@@ -308,6 +309,28 @@
     return out;
   }
 
+  const DET_PLURAL = {
+    mi: "mis", tu: "tus", su: "sus", el: "los", la: "las", un: "unos", una: "unas",
+    este: "estos", esta: "estas", ese: "esos", esa: "esas", aquel: "aquellos",
+    nuestro: "nuestros", nuestra: "nuestras", todo: "todos", toda: "todas",
+  };
+  const NOT_PLURAL = new Set(["gracias", "jaja", "jajaja", "jajajaja", "ggs", "sus", "más", "uff"]);
+
+  function restoreSpanish(text, tokens) {
+    return text.replace(/(\b[\wáéíóúñ]+\s+)?\{\s*(\d+)\s*\}/gi, (m, before, i) => {
+      const value = tokens[i];
+      if (value === undefined) return m;
+      if (!before) return value;
+      const firstWord = value.split(" ")[0].toLowerCase();
+      const plural = /s$/.test(firstWord) && !NOT_PLURAL.has(firstWord);
+      const det = before.trim();
+      const fixed = plural && DET_PLURAL[det.toLowerCase()]
+        ? matchCase(det, DET_PLURAL[det.toLowerCase()]) + " "
+        : before;
+      return fixed + value;
+    });
+  }
+
   async function toSpanish(text) {
     const { prepared, tokens } = prepareOutgoing(text);
     let result = null;
@@ -320,7 +343,7 @@
     }
     if (!result || !result.text) return null;
     if (result.lang === "es" && spanishHits(text) > 0) return null; // they already wrote Spanish
-    const restored = restore(chatStyle(result.text, text), tokens);
+    const restored = restoreSpanish(chatStyle(result.text, text), tokens);
     return restored.replace(/\s+([,.!?])/g, "$1").replace(/\s{2,}/g, " ").trim();
   }
 
