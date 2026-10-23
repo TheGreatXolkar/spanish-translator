@@ -121,19 +121,37 @@
       : rep;
   }
 
-  function normalize(text) {
+  // Spanish slang that has a natural English equivalent: inserted directly into the
+  // translation (Google keeps {n} placeholders untouched), so "wey" reads as "dude", not "friend".
+  const ES_TO_EN = {
+    wey: "dude", güey: "dude", guey: "dude", wei: "dude", we: "dude",
+    compa: "buddy", compas: "buddies", carnal: "bro", carnala: "sis", cuate: "buddy", pana: "buddy",
+    parce: "bro", parcero: "bro", morro: "kid", morros: "kids", morra: "girl", morras: "girls",
+    chido: "cool", chida: "cool", chidos: "cool", chidas: "cool", padrísimo: "awesome", chingón: "awesome",
+    chingona: "awesome", neta: "for real", nmms: "no way", nmamz: "no way", alv: "damn", chale: "dang",
+    órale: "alright", orale: "alright", sale: "okay", va: "okay", simón: "yeah", simon: "yeah", nel: "nah",
+    xd: "lol", xD: "lol", jaja: "haha", jajaja: "haha", jsjs: "haha", ggs: "ggs", gg: "gg",
+  };
+
+  function normalize(text, tokens) {
     const glossary = userGlossary();
+    const keep = (en) => { tokens.push(en); return "{" + (tokens.length - 1) + "}"; };
     // "holaaaa" -> "hola", "siiii" -> "si" (keeps ll/rr/cc/nn/ee doubles)
     let out = text.replace(new RegExp("([" + LETTERS + "])\\1{2,}", "g"), (m, c) =>
       "lrcne".includes(c.toLowerCase()) ? c + c : c);
     out = out.replace(WORD_RE, (w) => {
       const lw = w.toLowerCase();
-      if (glossary[lw]) return glossary[lw];
+      if (glossary[lw]) return keep(glossary[lw]);
+      if (ES_TO_EN[lw]) {
+        if (lw === "we" && !spanishHits(text)) return w; // "we" in English stays "we"
+        if (lw === "va" || lw === "sale") return w;      // too ambiguous mid-sentence
+        return keep(ES_TO_EN[lw]);
+      }
       if (SLANG[lw]) return matchCase(w, SLANG[lw]);
       // "dijistes" -> "dijiste", "hicistes" -> "hiciste"
       if (/^[a-záéíóúñ]{2,}istes$/.test(lw)) return w.slice(0, -1);
       // laughter: "jajajaja", "jaja", "JAJAJ" -> "jaja"
-      if (/^(j[aeijs]){2,}j?$/.test(lw)) return "jaja";
+      if (/^(j[aeijs]){2,}j?$/.test(lw)) return keep("haha");
       return w;
     });
     // capitalize start for better sentence parsing
@@ -214,18 +232,96 @@
   // =====================================================================
   const SKIP_PREFIX = "\\"; // start a message with \ to send it untranslated
 
-  async function toSpanish(text) {
+  // Texting shorthand -> plain English, so Google understands it.
+  const EN_EXPAND = {
+    u: "you", ur: "your", r: "are", ya: "you", y: "why", idk: "I don't know", idc: "I don't care",
+    ik: "I know", ngl: "not gonna lie", tbh: "to be honest", rn: "right now", wyd: "what are you doing",
+    wbu: "what about you", hbu: "how about you", wanna: "want to", gonna: "going to", gotta: "have to",
+    ima: "I'm going to", imma: "I'm going to", lemme: "let me", gimme: "give me", pls: "please",
+    plz: "please", cuz: "because", bc: "because", cus: "because", thru: "through", nvm: "never mind",
+    omw: "on my way", brb: "be right back", fr: "for real", frfr: "for real", istg: "I swear",
+    im: "I'm", dont: "don't", cant: "can't", wont: "won't", didnt: "didn't", doesnt: "doesn't",
+    isnt: "isn't", arent: "aren't", whats: "what's", thats: "that's", hows: "how's", wheres: "where's",
+    ive: "I've", youre: "you're", theyre: "they're", tho: "though", sum: "some", smth: "something",
+    rly: "really", srsly: "seriously", prob: "probably", probs: "probably", def: "definitely",
+    w: "with", wo: "without", bout: "about", tryna: "trying to", finna: "about to", aight: "alright",
+    k: "okay", kk: "okay", ok: "okay", yea: "yeah", ye: "yeah", yh: "yeah", nah: "no",
+  };
+  // English slang with a natural Mexican/Latino chat equivalent, inserted untouched.
+  const EN_TO_ES = {
+    bro: "bro", bruh: "bro", dude: "wey", homie: "compa", homies: "compas", buddy: "compa",
+    buddies: "compas", fam: "compas", guys: "banda", lol: "jaja", lmao: "jajaja", lmfao: "jajajaja",
+    haha: "jaja", hahaha: "jajaja", xd: "xd", gg: "gg", ggs: "ggs", ty: "gracias", thx: "gracias",
+    tysm: "muchas gracias", np: "de nada", yw: "de nada", sus: "sus", noob: "noob", op: "OP",
+    cool: "chido", awesome: "chido", lit: "chido", dope: "chido", bet: "va", sheesh: "uff",
+    damn: "chale", dang: "chale", omg: "no manches", wtf: "qué rayos",
+  };
+  // Multi-word phrases first.
+  const EN_PHRASES = [
+    [/\bspanish (homies|homie|bros|guys|friends|people|speakers|peeps|gang)\b/gi, "compas latinos"],
+    [/\b(the )?spanish (speaking )?(people|guys|players|chat)\b/gi, "la raza latina"],
+    [/\bwhat'?s up\b|\bwassup\b|\bwsg\b|\bsup\b/gi, "qué onda"],
+    [/\bfor real\b/gi, "neta"],
+    [/\bno way\b/gi, "no manches"],
+    [/\bmy bad\b/gi, "perdón"],
+  ];
+
+  function prepareOutgoing(text) {
     const { masked, tokens } = protect(text);
+    const keep = (es) => { tokens.push(es); return "{" + (tokens.length - 1) + "}"; };
+    // reverse game terms: "feathers" -> "plumas"
+    const reverse = {};
+    const g = userGlossary();
+    Object.keys(g).forEach((es) => { reverse[g[es].toLowerCase()] = es; });
+    // 1) stretched words + texting shorthand -> plain English
+    let out = masked.replace(/([a-z])\1{2,}/gi, "$1");
+    out = out.replace(/[A-Za-z']+/g, (w) => {
+      const lw = w.toLowerCase();
+      if (EN_TO_ES[lw] || reverse[lw]) return w;
+      return EN_EXPAND[lw] || w;
+    });
+    // 2) phrases, then single slang words / game terms -> Spanish chat equivalents
+    EN_PHRASES.forEach(([re, es]) => { out = out.replace(re, () => keep(es)); });
+    out = out.replace(/[A-Za-z']+/g, (w) => {
+      const lw = w.toLowerCase();
+      if (reverse[lw]) return keep(reverse[lw]);
+      if (EN_TO_ES[lw]) return keep(EN_TO_ES[lw]);
+      if (/^(ha){2,}h?$/.test(lw)) return keep("jajaja");
+      return w;
+    });
+    // "testing ..." at the start reads better as "I'm testing ..."
+    out = out.replace(/^(\s*)testing\b/i, "$1I'm testing");
+    return { prepared: out, tokens };
+  }
+
+  // Make Google's Spanish sound like chat instead of a textbook.
+  function chatStyle(es, original) {
+    let out = es
+      .replace(/\{\s*(\d+)\s*\}/g, (m) => m) // (restored later)
+      .replace(/\s{2,}/g, " ")
+      .trim();
+    if (!/[.]$/.test(original.trim())) out = out.replace(/\.$/, "");         // no added full stop
+    const first = original.trim().match(/[A-Za-z]/);
+    if (first && first[0] === first[0].toLowerCase()) {                        // keep lowercase vibe
+      out = out.replace(/^([¿¡]?)([A-ZÁÉÍÓÚÑ])/, (m, p, c) => p + c.toLowerCase());
+    }
+    return out;
+  }
+
+  async function toSpanish(text) {
+    const { prepared, tokens } = prepareOutgoing(text);
     let result = null;
     if (Date.now() >= googleBlockedUntil) {
-      try { result = await googleTranslate(masked, "auto", "es"); }
+      try { result = await googleTranslate(prepared, "auto", "es"); }
       catch (e) { googleBlockedUntil = Date.now() + GOOGLE_COOLDOWN_MS; }
     }
     if (!result) {
-      try { result = await lingvaTranslate(masked, "en", "es"); } catch (e) { return null; }
+      try { result = await lingvaTranslate(prepared, "en", "es"); } catch (e) { return null; }
     }
-    if (!result || !result.text || result.lang === "es") return null; // already Spanish
-    return restore(result.text, tokens).trim();
+    if (!result || !result.text) return null;
+    if (result.lang === "es" && spanishHits(text) > 0) return null; // they already wrote Spanish
+    const restored = restore(chatStyle(result.text, text), tokens);
+    return restored.replace(/\s+([,.!?])/g, "$1").replace(/\s{2,}/g, " ").trim();
   }
 
   function outgoingContent(english, spanish) {
@@ -346,7 +442,7 @@
 
       pending.add(message.id);
       const { masked, tokens } = protect(message.content);
-      const prepared = normalize(masked);
+      const prepared = normalize(masked, tokens);
       let result = await enqueue(prepared, "auto");
 
       // Mixed Spanish/English chat can be detected as English; retry as Spanish if it has Spanish words.
