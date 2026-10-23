@@ -5,6 +5,9 @@
   const { FluxDispatcher, React, ReactNative } = vendetta.metro.common;
   const { findByStoreName } = vendetta.metro;
   const { useProxy } = vendetta.storage;
+  const { instead } = vendetta.patcher;
+  const { registerCommand } = vendetta.commands;
+  const MessageActions = vendetta.metro.findByProps("sendMessage", "receiveMessage");
   const { Forms } = vendetta.ui.components;
   const { FormSwitchRow, FormDivider, FormInput } = Forms;
   const storage = vendetta.plugin.storage;
@@ -14,6 +17,8 @@
   if (storage.autoTranslate === undefined) storage.autoTranslate = true;
   if (storage.showOriginal === undefined) storage.showOriginal = true;
   if (storage.translateHistory === undefined) storage.translateHistory = true;
+  if (storage.translateOutgoing === undefined) storage.translateOutgoing = false;
+  if (storage.outgoingShowEnglish === undefined) storage.outgoingShowEnglish = false;
   if (storage.glossary === undefined) storage.glossary = "pluma=feather, plumas=feathers";
 
   const MARKER = "​🌐"; // zero-width space + globe, marks our edits
@@ -168,9 +173,9 @@
   // =====================================================================
   let googleBlockedUntil = 0;
 
-  async function googleTranslate(text, source) {
+  async function googleTranslate(text, source, target) {
     const url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=" + source +
-      "&tl=en&dt=t&q=" + encodeURIComponent(text);
+      "&tl=" + (target || "en") + "&dt=t&q=" + encodeURIComponent(text);
     const res = await fetch(url);
     if (!res.ok) throw new Error("Google HTTP " + res.status);
     const data = await res.json();
@@ -178,13 +183,14 @@
     return { text: translated, lang: source === "auto" ? data[2] : source };
   }
 
-  async function lingvaTranslate(text) {
+  async function lingvaTranslate(text, from, to) {
+    from = from || "es"; to = to || "en";
     for (const base of LINGVA_INSTANCES) {
       try {
-        const res = await fetch(base + "/api/v1/es/en/" + encodeURIComponent(text));
+        const res = await fetch(base + "/api/v1/" + from + "/" + to + "/" + encodeURIComponent(text));
         if (!res.ok) continue;
         const data = await res.json();
-        if (data && data.translation) return { text: data.translation, lang: "es" };
+        if (data && data.translation) return { text: data.translation, lang: from };
       } catch (e) { /* try next instance */ }
     }
     throw new Error("All Lingva instances failed");
@@ -201,6 +207,77 @@
     }
     if (source === "auto" && spanishHits(text) === 0) throw new Error("Fallback needs Spanish");
     return await lingvaTranslate(text);
+  }
+
+  // =====================================================================
+  // 6. Outgoing: your English -> Spanish
+  // =====================================================================
+  const SKIP_PREFIX = "\\"; // start a message with \ to send it untranslated
+
+  async function toSpanish(text) {
+    const { masked, tokens } = protect(text);
+    let result = null;
+    if (Date.now() >= googleBlockedUntil) {
+      try { result = await googleTranslate(masked, "auto", "es"); }
+      catch (e) { googleBlockedUntil = Date.now() + GOOGLE_COOLDOWN_MS; }
+    }
+    if (!result) {
+      try { result = await lingvaTranslate(masked, "en", "es"); } catch (e) { return null; }
+    }
+    if (!result || !result.text || result.lang === "es") return null; // already Spanish
+    return restore(result.text, tokens).trim();
+  }
+
+  function outgoingContent(english, spanish) {
+    return storage.outgoingShowEnglish ? spanish + "\n-# " + english : spanish;
+  }
+
+  async function onSend(args, orig) {
+    const msg = args[1];
+    try {
+      const text = msg && typeof msg.content === "string" ? msg.content : "";
+      if (text.startsWith(SKIP_PREFIX)) {
+        msg.content = text.slice(SKIP_PREFIX.length);
+      } else if (text.startsWith("/") && text.slice(1).trim()) {
+        // "/your message" -> sent in Spanish (real slash commands never reach here)
+        const english = text.slice(1).trim();
+        const spanish = await toSpanish(english);
+        msg.content = spanish ? outgoingContent(english, spanish) : english;
+      } else if (storage.translateOutgoing && text.trim()) {
+        const spanish = await toSpanish(text);
+        if (spanish) msg.content = outgoingContent(text, spanish);
+      }
+    } catch (e) {
+      log.error("[SpanishTranslator] outgoing: " + (e && e.message));
+    }
+    return orig.apply(this, args); // always sends, even if translation failed
+  }
+
+  function registerEsCommand() {
+    return registerCommand({
+      name: "es",
+      displayName: "es",
+      description: "Send a message translated to Spanish",
+      displayDescription: "Send a message translated to Spanish",
+      applicationId: "-1",
+      inputType: 1,
+      type: 1,
+      options: [{
+        name: "text", displayName: "text",
+        description: "What you want to say in English", displayDescription: "What you want to say in English",
+        type: 3, required: true,
+      }],
+      async execute(args, ctx) {
+        const opt = args.find((a) => a.name === "text");
+        const english = opt ? String(opt.value) : "";
+        if (!english.trim()) return;
+        const spanish = await toSpanish(english);
+        MessageActions.sendMessage(ctx.channel.id, {
+          content: SKIP_PREFIX + outgoingContent(english, spanish || english),
+          invalidEmojis: [], validNonShortcutEmojis: [], tts: false,
+        });
+      },
+    });
   }
 
   // ---- Request queue: one at a time, spaced out ----
@@ -320,6 +397,10 @@
       React.createElement(FormDivider, null),
       row("showOriginal", "Show original", "Keep the Spanish text above the English translation"),
       React.createElement(FormDivider, null),
+      row("translateOutgoing", "Translate ALL my messages to Spanish", "Off: only messages starting with / are translated. On: everything is (start with \\ to skip)"),
+      React.createElement(FormDivider, null),
+      row("outgoingShowEnglish", "Include my English", "Add your original English in small text under the Spanish"),
+      React.createElement(FormDivider, null),
       FormInput && React.createElement(FormInput, {
         title: "Game terms (spanish=english, comma separated)",
         placeholder: "pluma=feather, plumas=feathers",
@@ -330,8 +411,13 @@
     );
   }
 
+  let unpatchSend = null;
+  let unregisterCommand = null;
+
   return {
     onLoad() {
+      unpatchSend = MessageActions ? instead("sendMessage", MessageActions, onSend) : null;
+      try { unregisterCommand = registerEsCommand(); } catch (e) { log.error("[SpanishTranslator] /es: " + e.message); }
       FluxDispatcher.subscribe("MESSAGE_CREATE", onMessageCreate);
       FluxDispatcher.subscribe("LOAD_MESSAGES_SUCCESS", onMessagesLoaded);
     },
@@ -339,6 +425,8 @@
       FluxDispatcher.unsubscribe("MESSAGE_CREATE", onMessageCreate);
       FluxDispatcher.unsubscribe("LOAD_MESSAGES_SUCCESS", onMessagesLoaded);
       queue.length = 0;
+      if (unpatchSend) unpatchSend();
+      if (unregisterCommand) unregisterCommand();
     },
     settings: Settings,
   };

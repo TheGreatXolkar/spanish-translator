@@ -3,6 +3,6 @@
   "description": "Live-translates Spanish messages to English using Google Translate (no API key), with Lingva as a fallback.",
   "authors": [{ "name": "ahappysloth", "id": "0" }],
   "main": "index.js",
-  "hash": "2.0.0",
+  "hash": "2.2.0",
   "vendetta": { "icon": "ic_locale_24px" }
 }
